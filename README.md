@@ -74,6 +74,7 @@ and it unlocks recovery of calls embedded in prose without risking false positiv
 | `xml_function` | `<function name="X">{json}</function>` and `<function=X>{json}</function>` | gemma, llama.cpp templates |
 | `invoke` | `<invoke name="X"><parameter …/></invoke>` | minimax, xml tool templates |
 | `kimi` | `<\|tool_call_begin\|>…<\|tool_call_argument_begin\|>{json}<\|tool_call_end\|>` | Kimi K2 |
+| `mistral` | `[TOOL_CALLS][{…}]` and `[TOOL_CALLS]name[ARGS]{json}` | Mistral / Devstral / Magistral |
 | `named_json` | `{"name": <known-tool>, …}` anywhere (only with `valid_names`) | catch-all, registry-gated |
 
 It also tolerates Python-dict argument syntax (single quotes) and parallel calls.

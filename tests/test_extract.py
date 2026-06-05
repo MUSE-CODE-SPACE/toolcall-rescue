@@ -80,6 +80,32 @@ def test_kimi_special_tokens():
     assert calls[0].arguments == {"id": 42}
 
 
+def test_mistral_tool_calls_array():
+    # Mistral/Devstral: [TOOL_CALLS] followed by a JSON array of call objects.
+    content = '[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Paris"}}]'
+    calls, _ = extract_tool_calls(content)
+    assert calls[0].name == "get_weather"
+    assert calls[0].arguments == {"city": "Paris"}
+    assert calls[0].format == "mistral"
+
+
+def test_mistral_name_args_form():
+    # Newer Mistral tokenizer: [TOOL_CALLS]name[ARGS]{json}.
+    content = '[TOOL_CALLS]get_weather[ARGS]{"city": "Seoul"}'
+    calls, _ = extract_tool_calls(content)
+    assert calls[0].name == "get_weather"
+    assert calls[0].arguments == {"city": "Seoul"}
+
+
+def test_mistral_after_reasoning_text():
+    # Reasoning model: prose/thinking, then the [TOOL_CALLS] block at the end.
+    content = 'Let me check the weather for you.\n[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Tokyo"}}]'
+    calls, residual = extract_tool_calls(content)
+    assert calls[0].name == "get_weather"
+    assert "[TOOL_CALLS]" not in residual
+    assert "Let me check" in residual
+
+
 def test_single_quoted_python_dict_args():
     # Some models emit Python-dict syntax instead of strict JSON.
     content = "<tool_call>{'name': 'add', 'arguments': {'a': 1}}</tool_call>"

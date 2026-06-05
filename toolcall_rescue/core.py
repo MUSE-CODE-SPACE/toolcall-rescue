@@ -190,6 +190,62 @@ def _find_kimi(content: str) -> Iterable[_RawHit]:
             yield name, obj, m.group(0)
 
 
+# 5b) Mistral / Devstral / Magistral special token `[TOOL_CALLS]`. Two shapes
+#     emitted across model/tokenizer versions:
+#       [TOOL_CALLS][{"name": "x", "arguments": {...}}, ...]   (JSON array)
+#       [TOOL_CALLS]x[ARGS]{json}                              (name + [ARGS])
+#     `[TOOL_CALLS]` is a control token, not prose, so presence-gating is safe.
+_MISTRAL_TAG = "[TOOL_CALLS]"
+_MISTRAL_NAME_RE = re.compile(r"([^\[\s]+)\s*\[ARGS\]\s*", re.IGNORECASE)
+
+
+def _find_mistral(content: str) -> Iterable[_RawHit]:
+    if _MISTRAL_TAG not in content:
+        return
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while True:
+        idx = content.find(_MISTRAL_TAG, cursor)
+        if idx == -1:
+            break
+        j = idx + len(_MISTRAL_TAG)
+        while j < len(content) and content[j] in " \t\r\n":
+            j += 1
+        cursor = j
+        if j >= len(content):
+            break
+        nxt = content[j]
+        if nxt == "[":  # JSON array of call objects
+            try:
+                arr, end = decoder.raw_decode(content, j)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(arr, list):
+                for el in arr:
+                    if isinstance(el, dict) and isinstance(el.get("name"), str):
+                        yield el["name"], _as_args(el.get("arguments", {})), content[idx:end]
+                cursor = end
+        elif nxt == "{":  # single bare call object
+            try:
+                obj, end = decoder.raw_decode(content, j)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                yield obj["name"], _as_args(obj.get("arguments", {})), content[idx:end]
+            cursor = end
+        else:  # name [ARGS] {json}
+            m = _MISTRAL_NAME_RE.match(content, j)
+            if not m:
+                continue
+            try:
+                obj, end = decoder.raw_decode(content, m.end())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield m.group(1), obj, content[idx:end]
+            cursor = end
+
+
 # 6) Name-gated JSON scanner (only runs when you pass valid_names). Finds
 #    {"name": <known-tool>, "arguments": {...}} anywhere, even mid-prose — safe
 #    *because* the name must match a real tool. This catches the messy cases the
@@ -215,6 +271,7 @@ _DETECTORS = (
     ("xml_function", _find_xml_function),
     ("invoke", _find_invoke),
     ("kimi", _find_kimi),
+    ("mistral", _find_mistral),
     ("bare_json", _find_bare_json),
 )
 
