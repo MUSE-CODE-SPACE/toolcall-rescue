@@ -3,9 +3,11 @@
 > Recover tool/function calls that **local & small LLMs emit as plain text** —
 > when the structured `tool_calls` field comes back empty. Zero dependencies.
 
+[![PyPI](https://img.shields.io/pypi/v/toolcall-rescue.svg)](https://pypi.org/project/toolcall-rescue/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-22%20passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -34,7 +36,11 @@ calls it can safely recover.
 pip install toolcall-rescue
 ```
 
-(or just vendor the single `toolcall_rescue/` folder — it's pure stdlib.)
+Latest from GitHub, or just vendor the single `toolcall_rescue/` folder — it's pure stdlib, zero dependencies:
+
+```bash
+pip install "git+https://github.com/MUSE-CODE-SPACE/toolcall-rescue.git"
+```
 
 ## Usage
 
