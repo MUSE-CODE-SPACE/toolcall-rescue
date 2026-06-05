@@ -246,6 +246,35 @@ def _find_mistral(content: str) -> Iterable[_RawHit]:
             cursor = end
 
 
+# 5c) Llama 3.1/3.2 `<|python_tag|>` special token, followed by a JSON object
+#     using "arguments" or "parameters". Control token => presence-gated, safe.
+_PYTHON_TAG = "<|python_tag|>"
+
+
+def _find_llama_python_tag(content: str) -> Iterable[_RawHit]:
+    if _PYTHON_TAG not in content:
+        return
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while True:
+        idx = content.find(_PYTHON_TAG, cursor)
+        if idx == -1:
+            break
+        j = idx + len(_PYTHON_TAG)
+        while j < len(content) and content[j] in " \t\r\n":
+            j += 1
+        cursor = j
+        if j < len(content) and content[j] == "{":
+            try:
+                obj, end = decoder.raw_decode(content, j)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                args = obj.get("arguments", obj.get("parameters", {}))
+                yield obj["name"], _as_args(args), content[idx:end]
+            cursor = end
+
+
 # 6) Name-gated JSON scanner (only runs when you pass valid_names). Finds
 #    {"name": <known-tool>, "arguments": {...}} anywhere, even mid-prose — safe
 #    *because* the name must match a real tool. This catches the messy cases the
@@ -272,6 +301,7 @@ _DETECTORS = (
     ("invoke", _find_invoke),
     ("kimi", _find_kimi),
     ("mistral", _find_mistral),
+    ("llama_python_tag", _find_llama_python_tag),
     ("bare_json", _find_bare_json),
 )
 

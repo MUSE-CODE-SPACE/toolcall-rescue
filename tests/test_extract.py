@@ -106,6 +106,15 @@ def test_mistral_after_reasoning_text():
     assert "Let me check" in residual
 
 
+def test_llama_python_tag():
+    # Llama 3.1/3.2 emits <|python_tag|> then a JSON object (arguments or parameters).
+    content = '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Busan"}}'
+    calls, _ = extract_tool_calls(content)
+    assert calls[0].name == "get_weather"
+    assert calls[0].arguments == {"city": "Busan"}
+    assert calls[0].format == "llama_python_tag"
+
+
 def test_single_quoted_python_dict_args():
     # Some models emit Python-dict syntax instead of strict JSON.
     content = "<tool_call>{'name': 'add', 'arguments': {'a': 1}}</tool_call>"
