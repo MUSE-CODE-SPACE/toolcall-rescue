@@ -14,15 +14,42 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 # A brace/tag is only "real" when it begins at content start, after a newline, or
 # right after another tag (e.g. a reasoning ``</think>`` block or a wrapper tag).
 # Prose always precedes a real word/space, which this lookbehind rejects.
 _ANCHOR = r"(?:(?<=^)|(?<=[\n\r])|(?<=>))[ \t]*"
+
+# Stricter variant for ``<function ...>`` forms: line/content start ONLY — no
+# ``(?<=>)`` tag boundary, and deliberately no sentence-punctuation boundary
+# (``.!?:``). A punctuation boundary is fine for *display stripping*, but here a
+# match gets EXECUTED, so "I'll call: <function name=...>" mid-prose must stay
+# inert. Real gemma / llama.cpp emissions start the tag on its own line.
+_LINE_ANCHOR = r"(?:(?<=^)|(?<=[\n\r]))[ \t]*"
+
+# -- kill switches -------------------------------------------------------------
+# Operators can disable recovery without touching code (e.g. while debugging an
+# agent, or in an injection-exposed deployment). Checked at call time, so a test
+# or a long-lived process can flip them dynamically.
+#
+#   TOOLCALL_RESCUE_DISABLE=1       -> extract_tool_calls returns ([], content)
+#   TOOLCALL_RESCUE_NO_BARE_JSON=1  -> only the bare-JSON detector is disabled
+#                                      (highest false-positive / injection
+#                                      surface); tag/token-framed formats keep
+#                                      working.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_disabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUTHY
 
 
 @dataclass(frozen=True)
@@ -83,14 +110,17 @@ _RawHit = tuple[str, dict[str, Any], str]
 
 
 # 1) <tool_call>{json}</tool_call>. Two cases:
-#    a) a COMPLETE pair — a strong signal; matched anywhere and consumes the
-#       opening tag too (so it doesn't get left behind in the residual).
+#    a) a COMPLETE pair — anchored to a line start or a preceding tag (e.g.
+#       ``</think><tool_call>``), so a pair *narrated mid-sentence* ("you would
+#       emit <tool_call>{…}</tool_call> here") never fires. A real same-line
+#       call after prose is still recoverable via the ``named_json`` scanner
+#       when you pass ``valid_names``.
 #    b) an ORPHAN close — some quantized local models (qwen2.5/gemma on Ollama,
 #       observed in the wild) drop the opening tag and emit only </tool_call>.
 #       The orphan form is line-start-anchored so a narrated "{…} </tool_call>"
 #       sitting mid-sentence never fires.
 _TOOL_CALL_PAIR_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    _ANCHOR + r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
 _TOOL_CALL_ORPHAN_RE = re.compile(
@@ -116,6 +146,14 @@ def _find_tool_call_tag(content: str) -> Iterable[_RawHit]:
 
 
 # 2) Whole-content bare JSON: the entire content is just {"name":..., "arguments":...}.
+#    This is the highest false-positive / injection surface of all the detectors
+#    (untrusted text echoed verbatim as the whole message could name a real tool),
+#    so it is additionally: whole-content-only, key-allowlisted, size-capped, and
+#    individually disable-able (``include_bare_json=False`` /
+#    ``TOOLCALL_RESCUE_NO_BARE_JSON=1``).
+_MAX_BARE_JSON_ARGS = 16_000  # bytes of serialized arguments
+
+
 def _find_bare_json(content: str) -> Iterable[_RawHit]:
     s = content.strip()
     if not (s.startswith("{") and s.endswith("}")):
@@ -126,14 +164,17 @@ def _find_bare_json(content: str) -> Iterable[_RawHit]:
     # Only treat it as a call if it looks like one (has a string name and nothing
     # beyond the call shape) — avoids promoting arbitrary JSON answers.
     if isinstance(obj.get("name"), str) and obj.keys() <= {"name", "arguments", "parameters"}:
-        args = obj.get("arguments", obj.get("parameters", {}))
-        yield obj["name"], _as_args(args), content
+        args = _as_args(obj.get("arguments", obj.get("parameters", {})))
+        if len(json.dumps(args)) > _MAX_BARE_JSON_ARGS:
+            return
+        yield obj["name"], args, content
 
 
 # 3) <function name="X">{json}</function>  (gemma-style)  and
 #    <function=X>{json}</function>          (pythonic / llama.cpp template)
+#    Line-start-only anchor (stricter than the tag-boundary one) — see _LINE_ANCHOR.
 _FUNCTION_RE = re.compile(
-    _ANCHOR + r"<function(?:\s+name\s*=\s*\"(?P<q>[^\"]+)\"[^>]*|\s*=\s*(?P<b>[^\s>]+)\s*)>"
+    _LINE_ANCHOR + r"<function(?:\s+name\s*=\s*\"(?P<q>[^\"]+)\"[^>]*|\s*=\s*(?P<b>[^\s>]+)\s*)>"
     r"(?P<body>(?:(?!</function>).)*)</function>",
     re.DOTALL | re.IGNORECASE,
 )
@@ -306,9 +347,37 @@ _DETECTORS = (
 )
 
 
+def _dedupe_overlapping(
+    labelled: list[tuple[str, str, dict[str, Any], str]], content: str
+) -> list[tuple[str, str, dict[str, Any], str]]:
+    """Drop any hit whose span overlaps an already-accepted span's byte range.
+
+    Detectors run most-specific-first, so on overlap the structural/tagged match
+    wins (e.g. a ``<tool_call>``-wrapped pair beats the ``named_json`` scanner
+    seeing the same JSON inside it — otherwise one call would be yielded twice).
+    Byte-identical spans collapse to one; distinct calls have distinct span text
+    (or distinct positions once earlier spans are accounted) and survive.
+    """
+    taken: list[tuple[int, int]] = []
+    kept: list[tuple[str, str, dict[str, Any], str]] = []
+    for hit in labelled:
+        span = hit[3]
+        start = content.find(span)
+        if start < 0:
+            continue
+        end = start + len(span)
+        if any(start < t_end and t_start < end for t_start, t_end in taken):
+            continue
+        taken.append((start, end))
+        kept.append(hit)
+    return kept
+
+
 def extract_tool_calls(
     content: str | None,
     valid_names: Iterable[str] | None = None,
+    *,
+    include_bare_json: bool = True,
 ) -> tuple[list[ToolCall], str]:
     """Recover tool calls a model emitted inside ``content``.
 
@@ -319,56 +388,95 @@ def extract_tool_calls(
     valid_names:
         Optional set of known tool names. When provided, an extra name-gated JSON
         scanner runs (catching calls embedded in prose, safely, because the name
-        must match), and every recovered call is filtered to this set. Highly
-        recommended — pass your tool registry's names.
+        must match **exactly** — there is deliberately no fuzzy correction), and
+        every recovered call is filtered to this set. Highly recommended — pass
+        your tool registry's names.
+    include_bare_json:
+        Set ``False`` to disable the whole-content bare-JSON detector — the
+        highest false-positive / injection surface — while keeping the
+        tag/token-framed formats. Also disable-able per-deployment via the
+        ``TOOLCALL_RESCUE_NO_BARE_JSON=1`` environment variable.
+
+    Environment
+    -----------
+    ``TOOLCALL_RESCUE_DISABLE=1`` is a global kill switch: recovery returns
+    ``([], content)`` untouched, without editing code.
 
     Returns
     -------
     (calls, residual):
         ``calls`` is the list of recovered :class:`ToolCall` (in the order found);
         ``residual`` is ``content`` with the matched spans removed (the prose the
-        model wrote around the call), trimmed.
+        model wrote around the call), trimmed. A recognized tool-call span whose
+        name fails the ``valid_names`` gate is *not* promoted but is still
+        stripped from the residual, so raw markup never leaks to display.
     """
     if not content or not isinstance(content, str):
         return [], (content or "")
+    if _env_disabled("TOOLCALL_RESCUE_DISABLE"):
+        return [], content
+
+    if include_bare_json and _env_disabled("TOOLCALL_RESCUE_NO_BARE_JSON"):
+        include_bare_json = False
 
     names = frozenset(valid_names) if valid_names is not None else None
 
     # Collect (format_label, name, args, span) from every detector, in order.
+    # One misbehaving detector must not take down the whole rescue path (this
+    # code runs inside agent loops), so each is isolated.
     labelled: list[tuple[str, str, dict[str, Any], str]] = []
     for fmt_name, detector in _DETECTORS:
-        for name, args, span in detector(content):
-            labelled.append((fmt_name, name, args, span))
+        if fmt_name == "bare_json" and not include_bare_json:
+            continue
+        try:
+            for name, args, span in detector(content):
+                labelled.append((fmt_name, name, args, span))
+        except Exception:
+            logger.warning("toolcall-rescue detector %r raised; skipped", fmt_name, exc_info=True)
 
     if names is not None:
         # The name-gated scanner only makes sense with a registry; it also recovers
         # cases the structural detectors miss (call embedded in prose).
-        for name, args, span in _find_named_json(content, names):
-            labelled.append(("named_json", name, args, span))
+        try:
+            for name, args, span in _find_named_json(content, names):
+                labelled.append(("named_json", name, args, span))
+        except Exception:
+            logger.warning("toolcall-rescue detector 'named_json' raised; skipped", exc_info=True)
 
     calls: list[ToolCall] = []
     residual = content
-    seen_spans: set[str] = set()
-    for fmt_name, name, args, span in labelled:
-        if names is not None and name not in names:
-            continue
-        if span in seen_spans:
-            continue
-        seen_spans.add(span)
-        calls.append(ToolCall(name=name, arguments=args, raw=span, format=fmt_name))
+    for fmt_name, name, args, span in _dedupe_overlapping(labelled, content):
+        # Strip recognized markup from the residual whether or not the call is
+        # promoted — a name-gated rejection shouldn't leak raw tags to display.
         if span in residual:
             residual = residual.replace(span, "", 1)
+        # Exact-name gate. Deliberately no fuzzy repair: a name lifted from
+        # free-text content is lower-trust than one from a structured field, and
+        # "correcting" it risks executing the wrong tool. Fail closed.
+        if names is not None and name not in names:
+            continue
+        calls.append(ToolCall(name=name, arguments=args, raw=span, format=fmt_name))
 
     return calls, residual.strip()
 
 
-def has_tool_call(content: str | None, valid_names: Iterable[str] | None = None) -> bool:
+def has_tool_call(
+    content: str | None,
+    valid_names: Iterable[str] | None = None,
+    *,
+    include_bare_json: bool = True,
+) -> bool:
     """True if at least one tool call can be recovered from ``content``."""
-    calls, _ = extract_tool_calls(content, valid_names)
+    calls, _ = extract_tool_calls(content, valid_names, include_bare_json=include_bare_json)
     return bool(calls)
 
 
-def strip_tool_calls(content: str | None, valid_names: Iterable[str] | None = None) -> str:
+def strip_tool_calls(
+    content: str | None,
+    valid_names: Iterable[str] | None = None,
+    *,
+    include_bare_json: bool = True,
+) -> str:
     """Return ``content`` with any recoverable tool-call spans removed."""
-    _, residual = extract_tool_calls(content, valid_names)
+    _, residual = extract_tool_calls(content, valid_names, include_bare_json=include_bare_json)
     return residual

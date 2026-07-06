@@ -142,6 +142,33 @@ def test_narrated_call_in_prose_is_ignored():
     assert calls == []
 
 
+def test_narrated_complete_pair_in_prose_is_ignored():
+    # A COMPLETE <tool_call> pair narrated mid-sentence must not fire either —
+    # the pair regex is anchored to a line start or a preceding tag boundary.
+    content = (
+        "For example you would emit "
+        '<tool_call>{"name": "drop_table", "arguments": {}}</tool_call> to call it.'
+    )
+    calls, residual = extract_tool_calls(content)
+    assert calls == []
+    assert residual == content
+
+
+def test_pair_after_reasoning_close_tag_fires():
+    # ...but a pair sitting right after another tag (e.g. </think>) is real.
+    content = '</think><tool_call>{"name": "now", "arguments": {}}</tool_call>'
+    calls, _ = extract_tool_calls(content)
+    assert [c.name for c in calls] == ["now"]
+
+
+def test_narrated_function_after_inline_tag_is_ignored():
+    # <function> forms use the STRICTER line-start-only anchor: even a preceding
+    # inline tag (here, prose HTML) must not arm them.
+    content = 'as shown here <br><function name="drop_table">{"x": 1}</function> in docs'
+    calls, _ = extract_tool_calls(content)
+    assert calls == []
+
+
 def test_plain_prose_yields_nothing():
     calls, residual = extract_tool_calls("Sure! The answer is 42. No tools needed.")
     assert calls == []
@@ -177,15 +204,100 @@ def test_valid_names_recovers_embedded_call():
     assert calls[0].format == "named_json"
 
 
+def test_exact_name_gate_no_fuzzy_repair():
+    # "search" != "web_search": a near-miss name from free text must fail closed,
+    # never be "corrected" to a registered tool.
+    content = '<tool_call>{"name": "search", "arguments": {"q": "x"}}</tool_call>'
+    calls, _ = extract_tool_calls(content, valid_names={"web_search"})
+    assert calls == []
+
+
+def test_rejected_span_still_stripped_from_residual():
+    # A recognized-format span whose name fails the gate is not promoted, but
+    # its markup is still removed so raw tags never leak to display.
+    content = 'before\n<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>\nafter'
+    calls, residual = extract_tool_calls(content, valid_names={"add"})
+    assert calls == []
+    assert "<tool_call>" not in residual
+    assert "before" in residual and "after" in residual
+
+
+def test_overlapping_detectors_yield_one_call():
+    # tool_call_tag and the named_json scanner both see this call; byte-range
+    # overlap dedupe must collapse them to ONE (structural detector wins).
+    content = '<tool_call>{"name": "add", "arguments": {"a": 1}}</tool_call>'
+    calls, _ = extract_tool_calls(content, valid_names={"add"})
+    assert len(calls) == 1
+    assert calls[0].format == "tool_call_tag"
+
+
+# -- kill switches & bare-JSON controls ---------------------------------------
+
+
+def test_global_kill_switch_env(monkeypatch):
+    monkeypatch.setenv("TOOLCALL_RESCUE_DISABLE", "1")
+    content = '<tool_call>{"name": "add", "arguments": {}}</tool_call>'
+    calls, residual = extract_tool_calls(content)
+    assert calls == []
+    assert residual == content  # content untouched when disabled
+
+
+def test_bare_json_opt_out_flag():
+    bare = '{"name": "get_time", "arguments": {}}'
+    calls, _ = extract_tool_calls(bare, include_bare_json=False)
+    assert calls == []
+    # ...while tag-framed formats keep working (narrowness guard).
+    tagged = '<tool_call>{"name": "get_time", "arguments": {}}</tool_call>'
+    calls, _ = extract_tool_calls(tagged, include_bare_json=False)
+    assert [c.name for c in calls] == ["get_time"]
+
+
+def test_bare_json_env_kill_switch(monkeypatch):
+    monkeypatch.setenv("TOOLCALL_RESCUE_NO_BARE_JSON", "true")
+    calls, _ = extract_tool_calls('{"name": "get_time", "arguments": {}}')
+    assert calls == []
+
+
+def test_bare_json_oversized_arguments_rejected():
+    huge = '{"name": "write_file", "arguments": {"data": "' + "A" * 20_000 + '"}}'
+    calls, _ = extract_tool_calls(huge)
+    assert calls == []
+
+
+def test_detector_exception_is_isolated(monkeypatch):
+    # One throwing detector must not take down the rescue path.
+    from toolcall_rescue import core
+
+    def boom(content):
+        raise RuntimeError("bad parser")
+        yield  # pragma: no cover
+
+    patched = (("boom", boom),) + core._DETECTORS
+    monkeypatch.setattr(core, "_DETECTORS", patched)
+    content = '<tool_call>{"name": "add", "arguments": {}}</tool_call>'
+    calls, _ = extract_tool_calls(content)
+    assert [c.name for c in calls] == ["add"]
+
+
 # -- residual + helpers ------------------------------------------------------
 
 
 def test_residual_keeps_surrounding_prose():
-    content = 'Okay! <tool_call>{"name": "ping", "arguments": {}}</tool_call> done.'
+    content = 'Okay!\n<tool_call>{"name": "ping", "arguments": {}}</tool_call>\ndone.'
     calls, residual = extract_tool_calls(content)
     assert calls[0].name == "ping"
     assert "Okay!" in residual and "done." in residual
     assert "<tool_call>" not in residual
+
+
+def test_same_line_call_after_prose_needs_registry():
+    # A same-line-after-prose pair is indistinguishable from narration, so the
+    # anchored detector stays silent — but with a registry the named_json
+    # scanner recovers the real call safely (exact-name gated).
+    content = 'Okay! <tool_call>{"name": "ping", "arguments": {}}</tool_call> done.'
+    assert extract_tool_calls(content)[0] == []
+    calls, _ = extract_tool_calls(content, valid_names={"ping"})
+    assert [c.name for c in calls] == ["ping"]
 
 
 def test_has_and_strip_helpers():
